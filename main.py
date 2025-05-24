@@ -1,104 +1,86 @@
+import os
 import requests
 import logging
-from exchange_utils import get_common_symbols
+from datetime import datetime, timedelta
+from telegram import Bot
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-BOT_TOKEN = '8133284248:AAHgjzGwDqBt1duhmptwN7ZN0Vc_lZToM3U'
-CHAT_ID = '5523230981'
+# Логирование
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def send_message(text):
-    url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
-    data = {'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'Markdown'}
-    response = requests.post(url, data=data)
-    return response.json()
+# Telegram
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-def fetch_data():
-    url = 'https://api.coingecko.com/api/v3/coins/markets'
-    params = {
-        'vs_currency': 'usd',
-        'order': 'market_cap_desc',
-        'per_page': 250,
-        'page': 1
-    }
-    response = requests.get(url, params=params)
-    return response.json()
+bot = Bot(token=TELEGRAM_TOKEN)
 
-import time
+# Binance API
+BINANCE_API_URL = "https://api.binance.com"
 
-def analyze_pumps(coins, allowed_symbols):
-    pumps = []
-    for coin in coins:
-        symbol = coin['symbol'].upper()
-        name = coin['name']
-
-        if symbol not in allowed_symbols:
-            continue
-
-        market_cap = coin.get('market_cap', 0) or 0
-        current_price = coin.get('current_price', 0)
-        volume_now = coin.get('total_volume', 0)
-
-        # имитируем 30-минутную давность, т.к. CoinGecko не отдаёт прям 30 мин
-        # представим, что объем 30 мин назад был на 25% меньше
-        volume_30min_ago = volume_now / 1.25
-        volume_growth = ((volume_now - volume_30min_ago) / volume_30min_ago) * 100
-
-        price_change_1h = coin.get('price_change_percentage_1h_in_currency', 0) or 0
-
-        if market_cap > 10_000_000:
-            if price_change_1h > 2.5 and volume_growth > 20:  # можно варьировать
-                pumps.append({
-                    'name': name,
-                    'symbol': symbol,
-                    'price': current_price,
-                    'market_cap': market_cap,
-                    'change_1h': price_change_1h,
-                    'volume_growth': volume_growth,
-                })
-    return pumps
-
-def create_report(pumps):
-    if not pumps:
-        return "Пампов не обнаружено за последние 30 минут."
-    report = "*Потенциальные пампы (30 мин анализ)*\n\n"
-    for p in pumps:
-        report += (f"{p['name']} ({p['symbol']})\n"
-                   f"Цена: ${p['price']:.4f}\n"
-                   f"Капитализация: ${p['market_cap'] / 1_000_000:.2f}M\n"
-                   f"Рост цены (1ч): {p['change_1h']:.2f}%\n"
-                   f"Рост объема (30м): {p['volume_growth']:.2f}%\n\n")
-    return report
 def get_binance_symbols():
+    url = f"{BINANCE_API_URL}/api/v3/exchangeInfo"
+    response = requests.get(url)
+    symbols = {
+        s["symbol"]
+        for s in response.json()["symbols"]
+        if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"
+    }
+    return symbols
+
+def get_binance_kline(symbol: str, interval: str = "1m", limit: int = 30):
+    url = f"{BINANCE_API_URL}/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    response = requests.get(url, params=params)
+    response.raise_for_status()
+    return response.json()
+
+def analyze_symbol(symbol):
     try:
-        response = requests.get('https://api.binance.com/api/v3/exchangeInfo')
-        data = response.json()
-        symbols = {item['symbol'] for item in data['symbols'] if item['quoteAsset'] == 'USDT'}
-        logging.info(f'Загружено {len(symbols)} торговых пар с Binance')
-        return symbols
+        klines = get_binance_kline(symbol)
+        if len(klines) < 30:
+            return None
+
+        first = klines[0]
+        last = klines[-1]
+
+        open_price = float(first[1])
+        close_price = float(last[4])
+        price_change = (close_price - open_price) / open_price * 100
+
+        volume_start = sum(float(k[5]) for k in klines[:15])
+        volume_end = sum(float(k[5]) for k in klines[15:])
+        volume_change = (volume_end - volume_start) / volume_start * 100 if volume_start else 0
+
+        if price_change > 3 and volume_change > 100:
+            return {
+                "symbol": symbol,
+                "price_change": round(price_change, 2),
+                "volume_change": round(volume_change, 2)
+            }
+
     except Exception as e:
-        logging.error(f"Ошибка при получении символов с Binance: {e}")
-        return set()
+        logging.warning(f"Ошибка при анализе {symbol}: {e}")
+    return None
 
-def get_bybit_symbols():
-    try:
-        response = requests.get('https://api.bybit.com/v5/market/instruments?category=spot')
-        data = response.json()
-        symbols = {item['symbol'].replace('/', '') for item in data['result']['list'] if item['quoteCoin'] == 'USDT'}
-        logging.info(f'Загружено {len(symbols)} торговых пар с Bybit')
-        return symbols
-    except Exception as e:
-        logging.error(f"Ошибка при получении символов с Bybit: {e}")
-        return set()
+def main():
+    logging.info("🚀 Старт анализа Binance...")
+    symbols = get_binance_symbols()
+    logging.info(f"📊 Найдено {len(symbols)} символов")
 
-if __name__ == '__main__':
-    coins = fetch_data()
-    allowed_symbols = get_common_symbols()
-    pumps = analyze_pumps(coins, allowed_symbols)
-    report = create_report(pumps)
-    result = send_message(report)
-    print(result)
-# Обновление для повторного запуска Render
+    pump_candidates = []
 
+    for symbol in symbols:
+        result = analyze_symbol(symbol)
+        if result:
+            pump_candidates.append(result)
+
+    if pump_candidates:
+        message = "🔥 Потенциальные пампы на Binance:\n"
+        for pump in pump_candidates:
+            message += f"\n🟢 {pump['symbol']}: +{pump['price_change']}% цены, +{pump['volume_change']}% объёма"
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+    else:
+        logging.info("📉 Пампов не обнаружено.")
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="Сегодня пампов не обнаружено.")
+
+if __name__ == "__main__":
+    main()
